@@ -1,4 +1,4 @@
-use crate::{
+use super::{
     DescribeResponse, ErrorResponse, InvokeResponse, Namespace, Op, Request, Response, Status, Var,
 };
 use bendy::decoding::{Error as BdecodeError, FromBencode, Object, ResultExt};
