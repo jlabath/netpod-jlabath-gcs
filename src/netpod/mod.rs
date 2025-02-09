@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use bendy::decoding::FromBencode;
 use bendy::encoding::ToBencode;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -10,7 +12,7 @@ use tokio::{
 mod impls;
 
 #[derive(Debug, PartialEq)]
-pub enum Op {
+enum Op {
     Describe,
     Invoke,
 }
@@ -28,18 +30,18 @@ impl Op {
 #[derive(PartialEq, Debug)]
 pub struct Request {
     op: Op,
-    id: Option<String>,
+    pub id: Option<String>,
     var: Option<String>,
-    args: Option<String>,
+    pub args: Option<String>,
 }
 
 #[derive(PartialEq, Debug)]
-pub struct Var {
+struct Var {
     name: String,
 }
 
 #[derive(PartialEq, Debug)]
-pub struct Namespace {
+struct Namespace {
     name: String,
     vars: Vec<Var>,
 }
@@ -81,6 +83,15 @@ pub fn err_response(id: Option<String>, err: anyhow::Error) -> Response {
     })
 }
 
+pub fn invoke_response(id: String, value: Vec<u8>) -> Response {
+    let r = InvokeResponse {
+        id,
+        status: Status::Done,
+        value,
+    };
+    Response::Invoke(r)
+}
+
 #[derive(PartialEq, Debug)]
 pub struct InvokeResponse {
     id: String,
@@ -95,7 +106,7 @@ pub enum Response {
     Error(ErrorResponse),
 }
 
-pub async fn read_request(stream: &mut UnixStream) -> Result<Request> {
+async fn read_request(stream: &mut UnixStream) -> Result<Request> {
     let mut buffer = [0; 1024 * 2];
     let mut data = Vec::new();
     let req: Option<Request>;
@@ -123,7 +134,7 @@ pub async fn read_request(stream: &mut UnixStream) -> Result<Request> {
     req.ok_or(anyhow!("request is None"))
 }
 
-pub fn decode_request(buffer: &[u8]) -> Result<Request> {
+fn decode_request(buffer: &[u8]) -> Result<Request> {
     // Check if the last byte is `e` (ASCII value for 'e') which marks dictionary termination
     if buffer[buffer.len() - 1] == b'e' {
         Request::from_bencode(buffer).map_err(|e| anyhow!("{}", e))
@@ -132,27 +143,31 @@ pub fn decode_request(buffer: &[u8]) -> Result<Request> {
     }
 }
 
-pub type HandlerFn = fn(Request) -> Pin<Box<dyn Future<Output = Result<Response>> + Send>>;
+pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Response>> + Send>>;
 
-pub async fn run_server(socket_path: &str, handler: HandlerFn) -> Result<()> {
+pub type HandlerFn = Box<dyn Fn(Request) -> HandlerFuture + Send + Sync>;
+
+pub async fn run_server(socket_path: &str, handler_map: HashMap<String, HandlerFn>) -> Result<()> {
     // Create the Unix listener
     let listener = UnixListener::bind(socket_path)?;
+    let handlers = Arc::new(handler_map);
 
     // Accept incoming connections
     loop {
         let (stream, _addr) = listener.accept().await?;
 
+        let hm = handlers.clone();
         // Spawn a task to handle the connection
-        tokio::spawn(async move { handle_client(stream, handler).await });
+        tokio::spawn(async move { handle_client(stream, hm).await });
     }
 }
 
-async fn handle_client(mut stream: UnixStream, handler: HandlerFn) {
+async fn handle_client(mut stream: UnixStream, handler_map: Arc<HashMap<String, HandlerFn>>) {
     let request = read_request(&mut stream).await;
 
     match request {
         Ok(req) => {
-            let response = handler(req).await;
+            let response = handle_request(handler_map, req).await;
             match response {
                 Ok(response) => match response.to_bencode() {
                     Ok(buf) => {
@@ -188,5 +203,71 @@ async fn handle_client(mut stream: UnixStream, handler: HandlerFn) {
         Err(e) => {
             eprintln!("trouble reading request from the stream {}", e);
         }
+    }
+}
+
+async fn handle_request(
+    handler_map: Arc<HashMap<String, HandlerFn>>,
+    req: Request,
+) -> Result<Response> {
+    match req.op {
+        Op::Describe => handle_describe(handler_map),
+        Op::Invoke => handle_invoke(handler_map, req).await,
+    }
+}
+
+fn handle_describe(handler_map: Arc<HashMap<String, HandlerFn>>) -> Result<Response> {
+    /* the describe response look like this
+    DescribeResponse{format: "json", namespaces: Vec[Namespace]}
+    where Namespace {name: String, vars: Vec[Var]}
+    */
+    let mut name_map: HashMap<&str, Namespace> = HashMap::new();
+    for full_name in handler_map.keys() {
+        if let Some((namespace_name, var_name)) = full_name.split_once("/") {
+            name_map
+                .entry(namespace_name)
+                .and_modify(|ns| {
+                    let var = Var {
+                        name: var_name.to_string(),
+                    };
+                    ns.vars.push(var)
+                })
+                .or_insert_with(|| {
+                    let var = Var {
+                        name: var_name.to_string(),
+                    };
+                    Namespace {
+                        name: namespace_name.to_string(),
+                        vars: vec![var],
+                    }
+                });
+        } else {
+            eprintln!("invalid name in handler_map {}", full_name);
+        }
+    }
+    let r = DescribeResponse {
+        format: "json".to_string(),
+        namespaces: name_map.into_values().collect(),
+    };
+    Ok(Response::Describe(r))
+}
+
+async fn handle_invoke(
+    handler_map: Arc<HashMap<String, HandlerFn>>,
+    req: Request,
+) -> Result<Response> {
+    if let Some(var_name) = &req.var {
+        if let Some(func) = handler_map.get(var_name) {
+            func(req).await
+        } else {
+            eprintln!("handler for {} not found", var_name);
+            Ok(err_response(
+                req.id,
+                anyhow!("error no handler for {}", var_name),
+            ))
+        }
+    } else {
+        eprintln!("request lacks var {:?}", &req);
+        Ok(err_response(req.id, anyhow!("request lacks var name")))
     }
 }

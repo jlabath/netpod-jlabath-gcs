@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
-use std::{env, fs, future::Future, path::Path, pin::Pin, process};
+use anyhow::Result;
+use std::{collections::HashMap, env, fs, path::Path, process, sync::Arc};
 mod netpod;
-use netpod::{err_response, run_server, Request, Response};
+use netpod::{invoke_response, run_server, HandlerFn, HandlerFuture, Request, Response};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,15 +18,31 @@ async fn main() -> Result<()> {
         fs::remove_file(socket_path)?;
     }
 
-    run_server(socket_path, handler_boxed).await?;
+    let shared_resource = Arc::new("conbtext".to_string());
+    let meta_handler = create_handler(shared_resource, |res, req| Box::pin(handle_meta(res, req)));
+
+    //build handler map
+    let mut handler_map: HashMap<String, HandlerFn> = HashMap::new();
+    handler_map.insert("netpod.jlabath.gcs/meta".to_string(), meta_handler);
+
+    run_server(socket_path, handler_map).await?;
     Ok(())
 }
 
-async fn handler(_request: Request) -> Result<Response> {
-    eprintln!("died as expected");
-    Ok(err_response(None, anyhow!("bad")))
+fn create_handler<F>(shared_resource: Arc<String>, my_handler: F) -> HandlerFn
+where
+    F: Fn(Arc<String>, Request) -> HandlerFuture + Send + Sync + 'static,
+{
+    Box::new(move |req: Request| Box::pin(my_handler(shared_resource.clone(), req)))
 }
 
-fn handler_boxed(req: Request) -> Pin<Box<dyn Future<Output = Result<Response>> + Send>> {
-    Box::pin(handler(req))
+async fn handle_meta(shared_resource: Arc<String>, req: Request) -> Result<Response> {
+    eprintln!(
+        "Hey I am in meta with shared_resurce: {}!",
+        &shared_resource
+    );
+    Ok(invoke_response(
+        req.id.unwrap_or("missing".to_string()),
+        "{\"size\": 1000}".as_bytes().to_vec(),
+    ))
 }
