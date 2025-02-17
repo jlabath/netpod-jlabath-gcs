@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
 bendy = { version = "0.3", features = [] }
 google-cloud-storage = "0.24.0"
 serde_json = "1.0"
+netpod_base = { git = "https://github.com/jlabath/netpod_base.git", rev="ee145af67815a48ba2e896d82c9f54acf90fcbc1"}
