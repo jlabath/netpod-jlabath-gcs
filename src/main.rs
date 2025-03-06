@@ -8,6 +8,7 @@ use std::{
     collections::HashMap, convert::TryFrom, env, error::Error, fs, path::Path, process,
     result::Result, sync::Arc,
 };
+use tokio::time::{Duration, timeout};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -54,10 +55,9 @@ async fn handle_meta(shared_resource: Arc<Client>, req: Request) -> Result<Respo
         .first()
         .ok_or_else(|| NetpodError::Message("no gs:// filepath given".to_string()))?;
     let o_req = GcsObjectRequest::try_from(gs_path.as_str())?;
-    let object = shared_resource
-        .get_object(&o_req.0)
-        .await
-        .map_err(from_error)?;
+    let future = shared_resource.get_object(&o_req.0);
+    let result = timeout(Duration::from_secs(20), future).await.map_err(from_error)?;
+    let object = result.map_err(from_error)?;
     //eprintln!("Object: {:?}", &object);
     let data = serde_json::to_vec(&object).map_err(from_error)?;
     Ok(invoke_response(
